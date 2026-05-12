@@ -1,0 +1,24 @@
+---
+- name: Home Lab Configuration Discovery - Single File
+  hosts: all
+  gather_facts: yes
+
+  tasks:
+    - name: Display basic system info
+      debug:
+        msg: 
+          - "Host: {{ ansible_hostname }}"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+    - name: Save configuration to a single consolidated file
+      copy:
+        # Use a Jinja2 loop to combine all gathered facts into one JSON array
+        content: >
+          [
+          {% for host in ansible_play_hosts %}
+            {{ hostvars[host].ansible_facts | to_nice_json }}{{ ',' if not loop.last else '' }}
+          {% endfor %}
+          ]
+        dest: "/ansible/all_lab_configs.json"
+      delegate_to: localhost
+      run_once: yes
