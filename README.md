@@ -4,7 +4,7 @@ Ansible automation for my personal homelab environment. This repository contains
 
 ## Overview
 
-This project uses Ansible running in a rootless Podman pod on an Apple Silicon Mac Mini (macOS) to manage and query Linux infrastructure nodes in the homelab. The goal is to automate configuration management, perform infrastructure discovery, and build toward a PostgreSQL-backed system state tracking solution.
+This project uses Ansible running in a rootless Podman pod on an Apple Silicon Mac Mini (macOS) to manage and query Linux infrastructure nodes in the homelab. The goal is to automate configuration management, perform infrastructure discovery, and store system state in a PostgreSQL database for historical tracking.
 
 All playbooks are version-controlled and synced to this repository via a self-hosted [Forgejo](https://forgejo.org/) git server.
 
@@ -19,9 +19,49 @@ All playbooks are version-controlled and synced to this repository via a self-ho
 
 ### Ansible Control Node
 - **Platform:** Apple Mac Mini M4 (macOS)
-- **Runtime:** Rootless Podman pod containing the Ansible environment
+- **Runtime:** Rootless Podman pod (`ansible-stack`) containing the Ansible environment and a PostgreSQL database container
 - **Connectivity:** SSH with key-based authentication
 - **Remote access:** Tailscale VPN for access outside the local network
+
+---
+
+## Pod Architecture
+
+Both the Ansible control container and the PostgreSQL database run inside the same rootless Podman pod (`ansible-stack`). Sharing a pod means both containers share a network namespace — Postgres is reachable at `127.0.0.1:5432` from within the Ansible container without any external port exposure.
+
+### Starting the Pod
+
+```bash
+# Create the pod
+podman pod create --name ansible-stack -p 8080:8000
+
+# Start the PostgreSQL container
+podman run -d \
+  --name ansible-db \
+  --pod ansible-stack \
+  -e POSTGRES_PASSWORD=<your_password> \
+  -e POSTGRES_USER=ansible \
+  -e POSTGRES_DB=ansible_inventory \
+  -v ~/homelab/ansible/postgres_data:/var/lib/postgresql/data:Z \
+  postgres:16 -c listen_addresses='*'
+
+# Start the Ansible container
+podman run -d \
+  --name ansible-server \
+  --pod ansible-stack \
+  -v ~/ansible:/ansible:Z \
+  -v ~/ansible/ssh_keys:/root/.ssh:Z \
+  localhost/local-ansible:latest \
+  sleep infinity
+```
+
+### Verify Both Containers Are in the Pod
+
+```bash
+podman ps --pod
+```
+
+Both `ansible-db` and `ansible-server` should show `ansible-stack` in the PODNAME column.
 
 ---
 
@@ -29,14 +69,18 @@ All playbooks are version-controlled and synced to this repository via a self-ho
 
 ```
 homelab-ansible/
-├── inventory/
-│   └── hosts.ini                  # Inventory file defining managed hosts
+├── ansible.cfg                        # Ansible configuration
+├── hosts.ini                          # Inventory file defining managed hosts
+├── gather_and_store.yml               # Gathers facts and stores results in PostgreSQL
 ├── playbooks/
-│   ├── gather_info.yml            # Queries each host and outputs an individual JSON file per machine
-│   └── gather_to_single_file.yml  # Queries all hosts and consolidates output into a single JSON file
+│   ├── gather_info.yml                # Queries each host and outputs individual JSON files
+│   └── gather_to_single_file.yml      # Queries all hosts and consolidates into a single JSON file
 ├── output/
-│   ├── <hostname>.json            # Per-host output from gather_info.yml (gitignored)
-│   └── all_lab_configs.json       # Consolidated output from gather_to_single_file.yml (gitignored)
+│   ├── <hostname>.json                # Per-host output (gitignored)
+│   └── all_lab_configs.json           # Consolidated output (gitignored)
+├── vars/
+│   └── secrets.yml                    # Ansible Vault encrypted credentials (gitignored)
+├── ssh_keys/                          # SSH keys and known_hosts (gitignored)
 └── README.md
 ```
 
@@ -44,22 +88,49 @@ homelab-ansible/
 
 ## Playbooks
 
+### `gather_and_store.yml` — Gather Facts and Store in PostgreSQL
+
+Connects to all managed hosts, gathers system facts, and stores the results in a PostgreSQL database running in the same Podman pod.
+
+**What it does:**
+- Phase 1: Connects to all hosts and gathers full system facts via `gather_facts: yes`
+- Phase 2: Creates the `homelab_inventory` database if missing, creates the `host_configs` table if missing, and inserts gathered facts as JSONB rows
+
+**Database schema:**
+```sql
+CREATE TABLE host_configs (
+    id            SERIAL PRIMARY KEY,
+    captured_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    host_name     TEXT,
+    data          JSONB
+);
+```
+
+**Usage:**
+```bash
+podman exec -it ansible-server ansible-playbook /ansible/gather_and_store.yml --ask-vault-pass
+```
+
+**Querying results:**
+```bash
+podman exec -it ansible-db psql -U ansible -d homelab_inventory
+```
+```sql
+SELECT host_name, captured_at FROM host_configs;
+```
+
+---
+
 ### `gather_info.yml` — Per-Host Configuration Discovery
 
 Queries each managed host individually and writes a separate JSON file for each machine, named after the host.
 
-**What it does:**
-- Connects to all hosts in inventory
-- Gathers full system facts via `gather_facts: yes` — OS, distribution, version, hardware, network interfaces, and more
-- Displays a summary of hostname and OS for each host
-- Writes an individual JSON facts file per host to the output directory on the control node
-
 **Usage:**
 ```bash
-ansible-playbook playbooks/gather_info.yml -i inventory/hosts.ini
+ansible-playbook playbooks/gather_info.yml -i hosts.ini
 
 # Run against a single host
-ansible-playbook playbooks/gather_info.yml -i inventory/hosts.ini --limit fedora-server
+ansible-playbook playbooks/gather_info.yml -i hosts.ini --limit fedora-server
 ```
 
 **Output:**
@@ -73,44 +144,20 @@ output/
 
 ### `gather_to_single_file.yml` — Consolidated Configuration Discovery
 
-Queries all managed hosts and consolidates the gathered facts from every machine into a single JSON array file for review and future database ingestion.
-
-**What it does:**
-- Connects to all hosts in inventory
-- Gathers full system facts via `gather_facts: yes`
-- Displays a summary of hostname and OS for each host
-- Consolidates all gathered facts across all hosts into a single JSON array using a Jinja2 loop
-- Writes the consolidated output to `output/all_lab_configs.json` on the control node via `delegate_to: localhost` and `run_once: yes`
+Queries all managed hosts and consolidates gathered facts into a single JSON array file.
 
 **Usage:**
 ```bash
-ansible-playbook playbooks/gather_to_single_file.yml -i inventory/hosts.ini
+ansible-playbook playbooks/gather_to_single_file.yml -i hosts.ini
 
-# Dry run (check mode)
-ansible-playbook playbooks/gather_to_single_file.yml -i inventory/hosts.ini --check
+# Dry run
+ansible-playbook playbooks/gather_to_single_file.yml -i hosts.ini --check
 ```
 
 **Output:**
 ```
 output/
 └── all_lab_configs.json
-```
-
-**Example task output:**
-```
-TASK [Display basic system info]
-ok: [fedora-server] => {
-    "msg": [
-        "Host: fedora-server",
-        "OS: Fedora 44"
-    ]
-}
-ok: [raspberrypi] => {
-    "msg": [
-        "Host: raspberrypi",
-        "OS: Ubuntu 22.04"
-    ]
-}
 ```
 
 ---
@@ -123,39 +170,49 @@ ok: [raspberrypi] => {
 - SSH key-based access configured between the control node and all managed hosts
 - Tailscale installed on all nodes for remote access
 
+### Vault Setup
+
+Credentials are stored in `vars/secrets.yml` encrypted with Ansible Vault:
+
+```bash
+ansible-vault create vars/secrets.yml
+```
+
+The file should contain:
+```yaml
+db_user: ansible
+db_password: <your_password>
+```
+
 ### Inventory Configuration
-Edit `inventory/hosts.ini` to match your environment:
+
+Edit `hosts.ini` to match your environment:
 
 ```ini
 [homelab]
-fedora-server ansible_host=<IP_OR_HOSTNAME> ansible_user=<YOUR_USER>
-raspberrypi   ansible_host=<IP_OR_HOSTNAME> ansible_user=<YOUR_USER>
-
-[homelab:vars]
-ansible_ssh_private_key_file=~/.ssh/id_ed25519
+fedora-server ansible_host=<IP_OR_HOSTNAME> ansible_user=ansible
+raspberrypi   ansible_host=<IP_OR_HOSTNAME> ansible_user=ansible
 ```
 
-### Running Playbooks
-```bash
-# Run per-host discovery (individual JSON files per machine)
-ansible-playbook playbooks/gather_info.yml -i inventory/hosts.ini
+### ansible.cfg
 
-# Run consolidated discovery (single all_lab_configs.json)
-ansible-playbook playbooks/gather_to_single_file.yml -i inventory/hosts.ini
+```ini
+[defaults]
+inventory = /ansible/hosts.ini
+interpreter_python = auto_silent
+stdout_callback = debug
+deprecation_warnings = False
 
-# Dry run either playbook (check mode)
-ansible-playbook playbooks/gather_info.yml -i inventory/hosts.ini --check
-ansible-playbook playbooks/gather_to_single_file.yml -i inventory/hosts.ini --check
-
-# Run against a single host
-ansible-playbook playbooks/gather_info.yml -i inventory/hosts.ini --limit fedora-server
+[ssh_connection]
+pipelining = True
+ssh_args = -o UserKnownHostsFile=/ansible/ssh_keys/known_hosts -i /ansible/ssh_keys/id_ed25519
 ```
 
 ---
 
 ## Roadmap
 
-- [ ] PostgreSQL integration — store playbook execution results and system state data in a PostgreSQL database for historical tracking and reporting
+- [x] PostgreSQL integration — store playbook execution results and system state data in PostgreSQL
 - [ ] Additional playbooks — package management, service state verification, security compliance checks
 - [ ] Scheduled execution — automate regular discovery runs via cron or Forgejo Actions
 - [ ] Alerting — notify on configuration drift or unexpected state changes
@@ -176,9 +233,10 @@ This repository is part of a broader homelab infrastructure setup. Other compone
 ## Security Notes
 
 - SSH key-based authentication only — password authentication disabled on managed hosts
-- Ansible runs inside a rootless Podman pod following principle of least privilege
-- `.env` files and any files containing secrets or credentials are excluded via `.gitignore`
-- Inventory files with specific IP addresses should be reviewed before committing to public repositories
+- Ansible and PostgreSQL run inside a rootless Podman pod following principle of least privilege
+- Pod networking keeps PostgreSQL off the external network — only accessible via `127.0.0.1` within the pod
+- Credentials are encrypted with Ansible Vault and excluded via `.gitignore`
+- SSH keys and known_hosts are excluded via `.gitignore`
 
 ---
 
