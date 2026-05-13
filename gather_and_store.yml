@@ -1,0 +1,49 @@
+---
+# Phase 1: Connect to the fleet and gather system information
+- name: Phase 1 - Gather Facts
+  hosts: all
+  gather_facts: yes
+
+# Phase 2: Connect to the local Postgres DB in the pod and store results
+- name: Phase 2 - Prepare DB and Store Data
+  hosts: localhost
+  connection: local
+  vars_files:
+    - vars/secrets.yml
+  
+  tasks:
+    - name: Create the database if it is missing
+      community.postgresql.postgresql_db:
+        name: homelab_inventory
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_password }}"
+        login_host: 127.0.0.1
+        maintenance_db: ansible_inventory
+        state: present
+
+    - name: Create the host_configs table
+      community.postgresql.postgresql_table:
+        login_db: homelab_inventory
+        name: host_configs
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_password }}"
+        login_host: 127.0.0.1
+        columns:
+          - id SERIAL PRIMARY KEY
+          - captured_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          - host_name TEXT
+          - data JSONB
+        state: present
+
+    - name: Insert gathered facts into the database
+      community.postgresql.postgresql_query:
+        login_db: homelab_inventory
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_password }}"
+        login_host: 127.0.0.1
+        query: "INSERT INTO host_configs (host_name, data) VALUES (%s, %s)"
+        positional_args:
+          - "{{ item }}"
+          - "{{ hostvars[item].ansible_facts | to_json }}"
+      loop: "{{ groups['all'] }}"
+      delegate_to: localhost
