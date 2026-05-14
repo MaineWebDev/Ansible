@@ -9,7 +9,7 @@
   hosts: localhost
   connection: local
   vars_files:
-    - vars/secrets.yml
+    - ../vars/secrets.yml
   
   tasks:
     - name: Create the database if it is missing

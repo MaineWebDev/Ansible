@@ -1,0 +1,169 @@
+---
+# =============================================================================
+# update_systems.yml
+# Runs system package updates on all managed hosts and logs results to
+# PostgreSQL for change management tracking and audit history.
+#
+# Phase 1: Connect to each host, run distro-appropriate package updates,
+#          capture updated package names/versions, and check reboot status.
+# Phase 2: Create the system_updates table if missing, then insert a
+#          timestamped record per host into the PostgreSQL database.
+#
+# Requirements:
+#   - ansible user has passwordless sudo on managed hosts
+#   - community.postgresql collection installed
+#   - ../vars/secrets.yml encrypted with ansible-vault (db_user, db_password)
+#   - PostgreSQL container running inside the same Podman pod
+# =============================================================================
+
+# Phase 1: Run updates on all managed hosts
+- name: Phase 1 - Update Systems
+  hosts: all
+  gather_facts: yes
+  become: yes
+
+  tasks:
+
+    # --- Fedora / dnf ---
+
+    - name: Update all packages (Fedora/dnf)
+      dnf:
+        name: "*"
+        state: latest
+        update_only: yes
+      register: dnf_result
+      when: ansible_distribution == "Fedora"
+
+    - name: Get updated package details (Fedora)
+      shell: >
+        dnf history info last |
+        grep -E "^(Updated|Install)" |
+        awk '{print $2, $3}'
+      register: dnf_package_details
+      changed_when: false
+      failed_when: false
+      when:
+        - ansible_distribution == "Fedora"
+        - dnf_result.changed
+
+    - name: Check reboot required (Fedora)
+      command: needs-restarting -r
+      register: reboot_check_fedora
+      failed_when: false
+      changed_when: false
+      when: ansible_distribution == "Fedora"
+
+    # --- Ubuntu / apt ---
+
+    - name: Update apt cache (Ubuntu)
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      when: ansible_distribution == "Ubuntu"
+
+    - name: Update all packages (Ubuntu/apt)
+      apt:
+        upgrade: dist
+      register: apt_result
+      when: ansible_distribution == "Ubuntu"
+
+    - name: Get updated package details (Ubuntu)
+      shell: >
+        grep "^$(date '+%Y-%m-%d')" /var/log/apt/history.log |
+        grep "Upgrade:" |
+        sed 's/Upgrade: //'
+      register: apt_package_details
+      changed_when: false
+      failed_when: false
+      when:
+        - ansible_distribution == "Ubuntu"
+        - apt_result.changed
+
+    - name: Check reboot required (Ubuntu)
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_check_ubuntu
+      when: ansible_distribution == "Ubuntu"
+
+    # --- Normalize results across distros ---
+
+    - name: Set update facts (Fedora)
+      set_fact:
+        update_status: "{{ 'updated' if dnf_result.changed else 'nothing_to_update' }}"
+        packages_updated: >-
+          {{
+            dnf_package_details.stdout_lines
+            if (dnf_result.changed and dnf_package_details.stdout_lines is defined)
+            else []
+          }}
+        reboot_required: "{{ reboot_check_fedora.rc == 1 }}"
+      when: ansible_distribution == "Fedora"
+
+    - name: Set update facts (Ubuntu)
+      set_fact:
+        update_status: "{{ 'updated' if apt_result.changed else 'nothing_to_update' }}"
+        packages_updated: >-
+          {{
+            apt_package_details.stdout_lines
+            if (apt_result.changed and apt_package_details.stdout_lines is defined)
+            else []
+          }}
+        reboot_required: "{{ reboot_check_ubuntu.stat.exists }}"
+      when: ansible_distribution == "Ubuntu"
+
+
+# Phase 2: Log results to PostgreSQL
+- name: Phase 2 - Log Update Results to PostgreSQL
+  hosts: localhost
+  connection: local
+  vars_files:
+    - ../vars/secrets.yml
+
+  tasks:
+
+    - name: Create system_updates table if missing
+      community.postgresql.postgresql_query:
+        login_db: homelab_inventory
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_password }}"
+        login_host: 127.0.0.1
+        autocommit: yes
+        query: >
+          CREATE TABLE IF NOT EXISTS system_updates (
+            id SERIAL PRIMARY KEY,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            host_name TEXT,
+            distribution TEXT,
+            packages_updated JSONB,
+            update_status TEXT,
+            reboot_required BOOLEAN
+          )
+
+    - name: Insert update results per host
+      community.postgresql.postgresql_query:
+        login_db: homelab_inventory
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_password }}"
+        login_host: 127.0.0.1
+        query: >
+          INSERT INTO system_updates
+            (host_name, distribution, packages_updated, update_status, reboot_required)
+          VALUES
+            (%s, %s, %s, %s, %s)
+        positional_args:
+          - "{{ item }}"
+          - "{{ hostvars[item].ansible_distribution }}"
+          - "{{ hostvars[item].packages_updated | default([]) | to_json }}"
+          - "{{ hostvars[item].update_status | default('failed') }}"
+          - "{{ hostvars[item].reboot_required | default(false) }}"
+      loop: "{{ groups['all'] }}"
+
+    - name: Report summary
+      debug:
+        msg:
+          - "Host: {{ item }}"
+          - "Status: {{ hostvars[item].update_status }}"
+          - "Packages updated: {{ hostvars[item].packages_updated | length }}"
+          - "Reboot required: {{ hostvars[item].reboot_required }}"
+      loop: "{{ groups['all'] }}"
+
