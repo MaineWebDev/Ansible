@@ -185,6 +185,10 @@ FROM system_updates
 ORDER BY updated_at DESC;
 ```
 
+---
+
+## Setup & Requirements
+
 ### Prerequisites
 - Podman installed on the control node (macOS)
 - Ansible running inside a rootless Podman pod
@@ -221,7 +225,61 @@ ansible-playbook playbooks/update_systems.yml -i inventory/hosts.ini --ask-vault
 ansible-playbook playbooks/gather_info.yml -i inventory/hosts.ini --limit fedora-server
 ```
 
-> **Note:** Playbooks that connect to PostgreSQL require ansible-vault credentials. Always pass `--ask-vault-pass` or configure a vault password file.
+> **Note:** Playbooks that connect to PostgreSQL require ansible-vault credentials. Always pass `--ask-vault-pass` or configure a vault password file for automated runs.
+
+---
+
+## Automated Execution
+
+`update_systems.yml` runs automatically on a weekly schedule via cron on the Mac Mini control node, executing inside the Ansible Podman container without manual intervention.
+
+### Vault Password File Setup
+
+For automated runs, store the vault password in a file on the control node rather than entering it interactively:
+
+```bash
+echo "your_vault_password" > ~/ansible/.vault_pass
+chmod 600 ~/ansible/.vault_pass
+```
+
+> **Important:** The vault password file must never be committed to version control. Confirm `.vault_pass` is listed in `.gitignore` before committing.
+
+Test the vault password file works correctly before configuring cron:
+```bash
+/opt/homebrew/bin/podman exec <ansible-container-name> \
+  ansible-playbook playbooks/update_systems.yml \
+  -i inventory/hosts.ini \
+  --vault-password-file /ansible/.vault_pass
+```
+
+### Cron Configuration
+
+The cron job runs on the Mac Mini host and calls `podman exec` to execute the playbook inside the Ansible container every Sunday at 3AM. Output is logged to `logs/update_systems.log` for auditability.
+
+Open crontab:
+```bash
+crontab -e
+```
+
+Add the following — replace `<ansible-container-name>` and `<your-username>` with your actual values:
+```bash
+PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+0 3 * * 0 podman exec <ansible-container-name> ansible-playbook playbooks/update_systems.yml -i inventory/hosts.ini --vault-password-file /ansible/.vault_pass >> /Users/<your-username>/ansible/logs/update_systems.log 2>&1
+```
+
+> **macOS note:** cron on macOS runs with a minimal PATH that does not include Homebrew binaries. Setting `PATH` explicitly at the top of the crontab is required for `podman` to be found. Alternatively use the full path to the `podman` binary (typically `/opt/homebrew/bin/podman` on Apple Silicon).
+
+Verify the cron entry saved correctly:
+```bash
+crontab -l
+```
+
+### Log Files
+
+Cron output is written to `logs/update_systems.log`. The `logs/` directory is gitignored. To monitor recent runs:
+```bash
+tail -50 ~/ansible/logs/update_systems.log
+```
 
 ---
 
@@ -229,9 +287,10 @@ ansible-playbook playbooks/gather_info.yml -i inventory/hosts.ini --limit fedora
 
 - [x] PostgreSQL integration — store fact gathering results as timestamped JSONB snapshots per host
 - [x] System update playbook — run package updates and log results to PostgreSQL with reboot flagging
+- [x] Scheduled execution — weekly cron job on Mac Mini control node runs update_systems.yml automatically
+- [ ] Migrate scheduled execution to Forgejo Actions using stored secrets
 - [ ] Configuration drift detection — query PostgreSQL to compare snapshots across runs and surface changes
 - [ ] Django query interface — web application to visualize host state, update history, and reboot status
-- [ ] Scheduled execution — automate regular discovery and update runs via cron or Forgejo Actions
 - [ ] Service state verification — playbook to check and log running services across all hosts
 - [ ] Alerting — notify on configuration drift or unexpected state changes
 
@@ -253,7 +312,8 @@ This repository is part of a broader homelab infrastructure setup. Other compone
 - SSH key-based authentication only — password authentication disabled on managed hosts
 - Ansible runs inside a rootless Podman pod following principle of least privilege
 - Database credentials stored in `vars/secrets.yml` encrypted with ansible-vault — never committed in plaintext
-- `vars/secrets.yml`, `.env` files, and output JSON files are excluded via `.gitignore`
+- Vault password file (`.vault_pass`) stored with `600` permissions on control node — never committed to version control
+- `vars/secrets.yml`, `.vault_pass`, `.env` files, `logs/`, and output JSON files are excluded via `.gitignore`
 - Inventory files with specific IP addresses should be reviewed before committing to public repositories
 - Ansible user on managed hosts has passwordless sudo scoped to package manager commands only
 
@@ -264,3 +324,4 @@ This repository is part of a broader homelab infrastructure setup. Other compone
 Personal homelab project. Background in Unix/Linux systems administration, government IT infrastructure, and Certification & Accreditation engineering within the U.S. Intelligence Community.
 
 Currently pursuing Red Hat Certified System Administrator (RHCSA) certification.
+
